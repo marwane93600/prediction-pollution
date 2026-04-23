@@ -1,3 +1,9 @@
+```{r setup_paths, include=FALSE}
+# Définir la racine du projet comme répertoire de travail
+# (le .rmd est dans analysis/, les données dans data/)
+knitr::opts_knit$set(root.dir = normalizePath(".."))
+```
+
 ```{r librairi}
 ###########################################################
 # 1. Préparation des données de pollution (OpenAQ)
@@ -13,7 +19,7 @@ library(gridExtra)
 library(grid)
 
 # 1) Importation du fichier brut
-poll_raw <- read_csv("data/openaq_location_2162591_measurments.csv")
+poll_raw <- read_csv("data/raw/openaq_location_2162591_measurments.csv")
 
 # Vérif : quels polluants ?
 unique(poll_raw$parameter)   # doit afficher "pm10" "pm25"
@@ -47,7 +53,7 @@ summary(pollution$pm25)
 summary(pollution$pm10)
 
 # 7) Sauvegarde version propre
-write_csv(pollution, "data/pollution_paris_propre.csv")
+write_csv(pollution, "data/clean/pollution_paris_propre.csv")
 
 ```
 
@@ -99,7 +105,7 @@ meteo <- data.frame(
 head(meteo)
 summary(meteo$temperature_2m)
 
-write_csv(meteo, "data/meteo_paris_propre.csv")
+write_csv(meteo, "data/clean/meteo_paris_propre.csv")
 ```
 
 ```{r}
@@ -107,8 +113,8 @@ write_csv(meteo, "data/meteo_paris_propre.csv")
 # 1. Fusion pollution + météo + création proxys trafic
 ###########################################################
 
-pollution <- read_csv("data/pollution_paris_propre.csv")
-meteo     <- read_csv("data/meteo_paris_propre.csv")
+pollution <- read_csv("data/clean/pollution_paris_propre.csv")
+meteo     <- read_csv("data/clean/meteo_paris_propre.csv")
 
 data <- pollution %>%
   inner_join(meteo, by = "datetime") %>%
