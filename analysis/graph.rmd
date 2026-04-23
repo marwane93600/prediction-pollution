@@ -1,0 +1,386 @@
+```{r librairi}
+###########################################################
+# 1. Préparation des données de pollution (OpenAQ)
+###########################################################
+library(tidyverse)
+library(lubridate)
+library(httr)
+library(jsonlite)
+library(corrplot)
+library(stargazer)
+library(rvest)
+library(gridExtra)
+library(grid)
+
+# 1) Importation du fichier brut
+poll_raw <- read_csv("data/openaq_location_2162591_measurments.csv")
+
+# Vérif : quels polluants ?
+unique(poll_raw$parameter)   # doit afficher "pm10" "pm25"
+
+# 2) On crée une date arrondie à l'heure près
+# (au cas où il y ait plusieurs mesures dans la même heure)
+pollution <- poll_raw %>%
+  mutate(
+    datetime = ymd_hms(datetimeLocal),
+    datetime_hour = floor_date(datetime, unit = "hour")
+  ) %>%
+  # 3) On garde seulement ce qui est utile
+  select(datetime_hour, parameter, value) %>%
+  rename(datetime = datetime_hour) %>%
+  # 4) On regroupe par date+polluant et on fait la moyenne
+  group_by(datetime, parameter) %>%
+  summarise(
+    value = mean(value, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  # 5) On passe en colonnes pm10 / pm25
+  pivot_wider(
+    names_from  = parameter,
+    values_from = value
+  ) %>%
+  arrange(datetime)
+
+# 6) Vérifications
+head(pollution)
+summary(pollution$pm25)
+summary(pollution$pm10)
+
+# 7) Sauvegarde version propre
+write_csv(pollution, "data/pollution_paris_propre.csv")
+
+```
+
+```{r}
+start_date <- as.Date("2025-10-26")
+end_date   <- as.Date("2025-11-27")
+
+start_date
+end_date   # juste pour vérifier dans la console
+
+#### 2. Appel à l'API Open-Meteo (données horaires) ####
+
+lat <- 48.8566
+lon <- 2.3522
+
+base_url_met <- "https://archive-api.open-meteo.com/v1/archive"
+
+params_met <- list(
+  latitude   = lat,
+  longitude  = lon,
+  start_date = as.character(start_date),
+  end_date   = as.character(end_date),
+  hourly     = paste(
+    c("temperature_2m",
+      "relativehumidity_2m",
+      "windspeed_10m",
+      "precipitation"),
+    collapse = ","
+  ),
+  timezone = "Europe/Paris"
+)
+
+print(params_met)  # pour vérifier ce qui est envoyé
+
+res_met <- GET(base_url_met, query = params_met)
+stop_for_status(res_met)   # doit passer sans erreur
+
+json_met  <- content(res_met, as = "text", encoding = "UTF-8")
+met_list  <- fromJSON(json_met)
+
+meteo <- data.frame(
+  datetime       = ymd_hm(met_list$hourly$time),
+  temperature_2m = met_list$hourly$temperature_2m,
+  humidity_2m    = met_list$hourly$relativehumidity_2m,
+  windspeed_10m  = met_list$hourly$windspeed_10m,
+  precipitation  = met_list$hourly$precipitation
+)
+
+head(meteo)
+summary(meteo$temperature_2m)
+
+write_csv(meteo, "data/meteo_paris_propre.csv")
+```
+
+```{r}
+###########################################################
+# 1. Fusion pollution + météo + création proxys trafic
+###########################################################
+
+pollution <- read_csv("data/pollution_paris_propre.csv")
+meteo     <- read_csv("data/meteo_paris_propre.csv")
+
+data <- pollution %>%
+  inner_join(meteo, by = "datetime") %>%
+  mutate(
+    hour         = lubridate::hour(datetime),
+    wday         = lubridate::wday(datetime, label = TRUE, week_start = 1),
+    weekend      = if_else(wday %in% c("Sat", "Sun"), 1, 0),
+    heure_pointe = if_else(hour %in% 7:9 | hour %in% 17:19, 1, 0)
+  ) %>%
+  filter(!is.na(pm25))   # on garde seulement les heures avec PM2.5 observé
+
+glimpse(data)
+ls()
+```
+
+```{r correlogramme}
+vars_cor <- data %>%
+  select(pm25, pm10, temperature_2m, humidity_2m, windspeed_10m, precipitation)
+
+cor_mat <- cor(vars_cor, use = "complete.obs")
+
+corrplot(cor_mat, method = "color", addCoef.col = "black",
+         tl.col = "black",
+         col = rev(COL2("RdBu", 10)) )
+
+         number.cex = 0.7,
+         title = "Corrélogramme des variables explicatives",
+         mar = c(0,0,2,0))
+```
+
+
+```{r regtression}
+###########################################################
+# 4. Modèles économétriques
+###########################################################
+
+# Modèle 1 : Météo seule
+m1 <- lm(pm25 ~ temperature_2m + humidity_2m + windspeed_10m + precipitation,
+         data = data)
+
+# Modèle 2 : Météo + Proxys trafic
+m2 <- lm(pm25 ~ temperature_2m + humidity_2m +
+                 windspeed_10m + precipitation +
+                 heure_pointe + weekend,
+         data = data)
+
+# Modèle 3 : Modèle complet
+m3 <- lm(pm25 ~ temperature_2m + humidity_2m +
+                 windspeed_10m + precipitation +
+                 heure_pointe + weekend +
+                 pm10,
+         data = data)
+
+summary(m1)
+summary(m2)
+summary(m3)
+
+# Tableau comparatif stargazer
+stargazer(m1, m2, m3,
+          type = "text",
+          title = "Modèles expliquant la concentration de PM2.5 à Paris",
+          dep.var.labels = "PM2.5 (µg/m³)",
+          covariate.labels = c("Température (°C)",
+                               "Humidité (%)",
+                               "Vitesse du vent (m/s)",
+                               "Précipitations (mm)",
+                               "Heure de pointe",
+                               "Weekend",
+                               "PM10 (µg/m³)"))
+
+```
+
+
+```{r}
+names(pollution)
+
+```
+
+
+```{r}
+###########################################################
+# Modèle 1 : météo seule
+###########################################################
+
+m1 <- lm(pm25 ~ temperature_2m + humidity_2m +
+                 windspeed_10m + precipitation,
+         data = data)
+
+###########################################################
+# Modèle 2 : météo + autre polluant (PM10)
+###########################################################
+
+m2 <- lm(pm25 ~ temperature_2m + humidity_2m +
+                 windspeed_10m + precipitation +
+                 pm10,
+         data = data)
+
+###########################################################
+# Modèle 3 : météo + PM10 + trafic (proxys)
+###########################################################
+
+m3 <- lm(pm25 ~ temperature_2m + humidity_2m +
+                 windspeed_10m + precipitation +
+                 pm10 +
+                 heure_pointe + weekend,
+         data = data)
+# 1) Capturer la sortie texte de stargazer
+txt <- capture.output(
+  stargazer(m1, m2, m3, type = "text",
+            title = "Régressions PM2.5 à Paris")
+)
+
+# 2) Transformer en tableau graphique
+p <- tableGrob(txt)
+
+# 3) Enregistrer en image PNG
+ggsave("regression_PM25.png", p,
+       width = 10, height = 8, dpi = 300)
+
+
+summary(m1)
+summary(m2)
+summary(m3)
+
+stargazer(m1, m2, m3,
+          type = "text",
+          out = "regressions.tex",
+          title = "Modèles expliquant la concentration de PM2.5 à Paris",
+          dep.var.labels = "PM2.5 (µg/m³)",
+          column.labels = c("Météo", "Météo + PM10", "Météo + PM10 + trafic"),
+          covariate.labels = c("Température (°C)", "Humidité (%)",
+                               "Vitesse du vent (m/s)", "Précipitations (mm)",
+                               "PM10 (µg/m³)",
+                               "Heure de pointe", "Weekend"))
+
+```
+
+
+
+
+
+```{r graph 1}
+ggplot(data, aes(x = pm25)) +
+  geom_histogram(aes(y = after_stat(density)),
+                 bins = 30,
+                 fill = "grey80",
+                 color = "white") +
+  geom_density(linewidth = 1) +
+  labs(
+    title = "Distribution de PM2.5 à Paris (station Les Halles)",
+    x = "PM2.5 (µg/m³)",
+    y = "Densité"
+  ) +
+  theme_minimal(base_size = 13)
+
+
+```
+
+
+```{r graph 2}
+pm25_jour <- data %>%
+  mutate(date = as.Date(datetime)) %>%
+  group_by(date) %>%
+  summarise(pm25_mean = mean(pm25, na.rm = TRUE))
+
+ggplot(pm25_jour, aes(x = date, y = pm25_mean)) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 1.8) +
+  labs(
+    title = "PM2.5 : moyenne journalière",
+    x = "Date",
+    y = "PM2.5 moyen (µg/m³)"
+  ) +
+  theme_minimal(base_size = 13)
+
+
+```
+
+```{r graph3}
+ggplot(data, aes(x = temperature_2m, y = pm25)) +
+  geom_point(alpha = 0.25, size = 1.2) +
+  geom_smooth(method = "loess", se = FALSE, linewidth = 1) +
+  labs(
+    title = "PM2.5 en fonction de la température",
+    x = "Température (°C)",
+    y = "PM2.5 (µg/m³)"
+  ) +
+  theme_minimal(base_size = 13)
+
+
+```
+
+```{r graph 4}
+data <- data %>%
+  mutate(
+    type_jour = factor(
+      weekend,
+      levels = c(0, 1),
+      labels = c("Jour de semaine", "Weekend")
+    )
+  )
+
+ggplot(data, aes(x = type_jour, y = pm25)) +
+  geom_boxplot(fill = "grey85") +
+  labs(
+    title = "PM2.5 selon le type de jour",
+    x = "",
+    y = "PM2.5 (µg/m³)"
+  ) +
+  theme_minimal(base_size = 13)
+
+```
+
+```{r}
+data <- data %>%
+  mutate(
+    heure_pointe_fac = factor(
+      heure_pointe,
+      levels = c(0, 1),
+      labels = c("Hors heures de pointe", "Heures de pointe")
+    )
+  )
+
+ggplot(data, aes(x = type_jour, y = pm25)) +
+  geom_boxplot(fill = "grey85") +
+  facet_wrap(~ heure_pointe_fac) +
+  labs(
+    title = "PM2.5 selon le trafic (jour vs heures de pointe)",
+    x = "",
+    y = "PM2.5 (µg/m³)"
+  ) +
+  theme_minimal(base_size = 13)
+
+```
+
+```{r}
+ggplot(vent_jour, aes(date, wind_mean)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  geom_vline(xintercept = as.Date("2025-11-21"), color = "red", linetype = "dashed") +
+  labs(
+    title = "Vitesse moyenne du vent à Paris",
+    x = "Date",
+    y = "Vitesse du vent (m/s)"
+  ) +
+  theme_minimal(base_size = 13)
+
+
+```
+
+```{r}
+ggplot(data, aes(x = windspeed_10m, y = pm25)) +
+  geom_point(alpha = 0.25, size = 1.2) +
+  geom_smooth(method = "loess", se = FALSE, linewidth = 1, color = "blue") +
+  labs(
+    title = "PM2.5 en fonction de la vitesse du vent",
+    x = "Vitesse du vent (m/s)",
+    y = "PM2.5 (µg/m³)"
+  ) +
+  theme_minimal(base_size = 13)
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
